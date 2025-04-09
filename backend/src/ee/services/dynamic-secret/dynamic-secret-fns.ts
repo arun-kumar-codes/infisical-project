@@ -1,0 +1,51 @@
+import dns from "node:dns/promises";
+import net from "node:net";
+
+import { getConfig } from "@app/lib/config/env";
+import { BadRequestError } from "@app/lib/errors";
+import { isPrivateIp } from "@app/lib/ip/ipRange";
+import { getDbConnectionHost } from "@app/lib/knex";
+
+export const verifyHostInputValidity = async (host: string, isGateway = false) => {
+  const appCfg = getConfig();
+  // if (appCfg.NODE_ENV === "development") return ["host.docker.internal"]; // incase you want to remove this check in dev
+
+  const reservedHosts = [appCfg.DB_HOST || getDbConnectionHost(appCfg.DB_CONNECTION_URI)].concat(
+    (appCfg.DB_READ_REPLICAS || []).map((el) => getDbConnectionHost(el.DB_CONNECTION_URI)),
+    getDbConnectionHost(appCfg.REDIS_URL)
+  );
+
+  // get host db ip
+  const exclusiveIps: string[] = [];
+  for await (const el of reservedHosts) {
+    if (el) {
+      if (net.isIPv4(el)) {
+        exclusiveIps.push(el);
+      } else {
+        const resolvedIps = await dns.resolve4(el);
+        exclusiveIps.push(...resolvedIps);
+      }
+    }
+  }
+
+  const normalizedHost = host.split(":")[0];
+  const inputHostIps: string[] = [];
+  if (net.isIPv4(host)) {
+    inputHostIps.push(host);
+  } else {
+    if (normalizedHost === "localhost" || normalizedHost === "host.docker.internal") {
+      throw new BadRequestError({ message: "Invalid db host" });
+    }
+    const resolvedIps = await dns.resolve4(host);
+    inputHostIps.push(...resolvedIps);
+  }
+
+  if (!isGateway) {
+    const isInternalIp = inputHostIps.some((el) => isPrivateIp(el));
+    if (isInternalIp) throw new BadRequestError({ message: "Invalid db host" });
+  }
+
+  const isAppUsedIps = inputHostIps.some((el) => exclusiveIps.includes(el));
+  if (isAppUsedIps) throw new BadRequestError({ message: "Invalid db host" });
+  return inputHostIps;
+};
